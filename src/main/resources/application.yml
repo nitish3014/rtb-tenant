@@ -1,0 +1,87 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: rtb-tenant-service
+
+  datasource:
+    driverClassName: org.postgresql.Driver
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    # Hibernate ddl auto (create, create-drop, validate, update)
+    # Change hibernate.ddl-auto value to validate when flyway is being used.
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        default_schema: ${DATABASE_SCHEMA:public}
+        jdbc:
+          lob:
+            non_contextual_creation: true
+  flyway:
+    enabled: false
+
+# Service configuration / env
+template-service:
+  environment: ${ENVIRONMENT:dev}
+
+auth:
+  public-key: ${PUBLIC_KEY_CONTENT:default_value}
+  private-key: ${PRIVATE_KEY_CONTENT:default_value}
+  hotel-admin-access-token-expiry: 1
+  hotel-bellboy-access-token-expiry: 5
+
+
+external:
+  api:
+    file-service:
+      url: ${FILE_SERVICE_API}
+    communication-service:
+      url: ${COMMUNICATION_SERVICE_API}
+
+url:
+  message_bus_service: ${MESSAGE_BUS_SERVICE_URL}
+
+aws:
+  access-key-id: ${AWS_ACCESS_KEY_ID}
+  secret-access-key: ${AWS_SECRET_ACCESS_KEY}
+  region: ${AWS_REGION}
+  account-id: ${AWS_ACCOUNT_ID}
+  dashboard-id: ${AWS_DASHBOARD_ID}
+
+
+springdoc:
+  api-docs:
+    path: /api/v1/tenants/v3/api-docs
+  swagger-ui:
+    path: /api/v1/tenants/swagger-ui/index.html
+
+  
+management:
+  server:
+    port: 8082
+  security:
+    enabled: false
+    roles: NONE 
+  endpoints:
+    web:
+      base-path: "/api/v1/tenants/actuator"
+      exposure:
+        include: "*"
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  prometheus:
+    metrics:
+      export:
+        enabled: true
