@@ -1,4 +1,4 @@
-## Tenant Service
+## Tenant Service 
 ## Section 1: Adding DB and packages
 
 * To add DB, update the `application.yml` file.
