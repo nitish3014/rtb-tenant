@@ -100,11 +100,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
 
+      - name: Set VERSION env variable
+        run: echo "VERSION=$(git rev-parse --short HEAD)-${{ github.run_number }}" >> $GITHUB_ENV
+      
       - name: Build & Push Docker image
         run: |
           IMAGE_URI=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DEPLOYMENT_NAME }}
-          VERSION=$(git rev-parse --short HEAD)-${{ github.run_number }}
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
           docker buildx build \
             --platform linux/arm64 \
             --cache-from type=registry,ref=${IMAGE_URI}:cache \
@@ -112,6 +113,7 @@ jobs:
             -t ${IMAGE_URI}:${{ env.VERSION }} \
             -t ${IMAGE_URI}:latest \
             --push .
+
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v3
