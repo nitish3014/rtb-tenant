@@ -41,6 +41,11 @@ jobs:
           distribution: temurin
           java-version: '17'
           cache: gradle
+      # Fetch artifact from S3
+      - name: Fetch JAR from S3
+        run: |
+          mkdir -p libs
+          aws s3 cp s3://${{ env.S3_BUCKET_NAME }}/${{ env.S3_ARTIFACT_KEY }} libs/
 
       # 4. Build using Gradle (skip tests)
       - name: Build with Gradle
