@@ -1,23 +1,27 @@
-FROM eclipse-temurin:17-jdk-alpine as builder
+FROM eclipse-temurin:17-jdk-slim AS builder
+WORKDIR /build
 
-WORKDIR /tmp/app
+COPY gradlew settings.gradle build.gradle gradle/ ./
+RUN chmod +x gradlew \
+    && ./gradlew --no-daemon help --build-cache
 
-COPY . /tmp/app
+COPY . .
+RUN ./gradlew clean build -x test --parallel --stacktrace --no-daemon
 
-RUN ./gradlew clean build --stacktrace
 
-FROM eclipse-temurin:17-jre-alpine
-
+FROM eclipse-temurin:17-jre-slim
 WORKDIR /app
 
-COPY --from=builder /tmp/app/build/libs/rtb-tenant-service-0.0.1-SNAPSHOT.jar /app/app.jar
+COPY --from=builder /build/build/libs/*.jar app.jar
 
-COPY entrypoint.sh /app/entrypoint.sh
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini bash \
+ && ln -sf /usr/bin/tini /sbin/tini \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN chmod +x /app/entrypoint.sh
 
-RUN apk add --no-cache tini bash
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 EXPOSE 8080
-
-ENTRYPOINT ["/sbin/tini", "--", "/app/entrypoint.sh"]
+ENTRYPOINT ["/sbin/tini", "--", "./entrypoint.sh"]
