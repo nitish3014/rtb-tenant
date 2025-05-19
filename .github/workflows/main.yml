@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       AWS_REGION: us-east-1
-      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_ACCOUNT_ID: 972251037797
       EKS_CLUSTER_NAME: rtb-eks-dev
       DEPLOYMENT_NAME: rtb-dev-tenant-service
       K8S_NAMESPACE: default
@@ -54,7 +54,44 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew clean build -x test --parallel --no-daemon --stacktrace
 
-      - name: Login to ECR
+      - name: Fetch kubeconfig via Bastion
+        run: |
+          echo "${{ secrets.BASTION_PEM_KEY }}" > bastion_key.pem
+          chmod 600 bastion_key.pem
+          ssh -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} "aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}"
+          scp -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:~/.kube/config ./kubeconfig
+    
+      - name: Fetch AWS Secrets & Store in Kubernetes
+        env:
+          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+        run: |
+          DB=$(aws secretsmanager get-secret-value --secret-id rtb-dev/db --query SecretString --output text)
+          AW=$(aws secretsmanager get-secret-value --secret-id rtb-dev/aws --query SecretString --output text)
+          SERVICE=$(aws secretsmanager get-secret-value --secret-id rtb-dev/tenant-service --query SecretString --output text)
+          if [ -z "$DB" ] || [ -z "$AW" ]; then
+            echo "❌ Missing AWS secrets" && exit 1
+          fi
+          echo "$DB" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' > /tmp/secrets.env
+          echo "$AW" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
+          echo "$SERVICE" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
+          tac /tmp/secrets.env | awk -F= '!seen[$1]++' | tac > /tmp/secrets.unique.env
+          PUB_B64=$(base64 public_key.pem | tr -d '\n')
+          echo "PUBLIC_KEY_CONTENT=${PUB_B64}" >> /tmp/secrets.unique.env
+    
+          kubectl delete secret ${{ env.DEPLOYMENT_NAME }} -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
+          kubectl create secret generic ${{ env.DEPLOYMENT_NAME }} \
+            --from-env-file=/tmp/secrets.unique.env \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+    
+      - name: Set up Docker Buildx for multi-arch build
+        uses: docker/setup-buildx-action@v2
+        with:
+          driver: docker-container
+          buildkitd-flags: --debug
+          install: true
+    
+      - name: Login to Amazon ECR
         run: |
           aws ecr get-login-password --region ${{ env.AWS_REGION }} \
             | docker login --username AWS --password-stdin \
