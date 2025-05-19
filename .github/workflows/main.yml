@@ -1,4 +1,4 @@
-name: CI/CD Deploy to EKS
+name: CI/CD Deploy to EKS via Bastion
 
 on:
   push:
@@ -23,128 +23,82 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Cache Gradle
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*','gradle-wrapper.properties') }}
-          restore-keys: gradle-
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Fetch core artifact from S3
+      - name: Sync code to Bastion
         run: |
-          mkdir -p libs
-          aws s3 cp s3://${{ env.S3_BUCKET_NAME }}/${{ env.S3_ARTIFACT_KEY }} libs/
+          rsync -avz --delete --exclude='.git' ./ ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:/home/${{ env.BASTION_USER }}/app-source
 
-      - name: Build with Gradle
-        run: ./gradlew clean build -x test --parallel --no-daemon --stacktrace
+      - name: Build and Push Docker image on Bastion
+        env:
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DEPLOYMENT_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          S3_BUCKET_NAME: ${{ env.S3_BUCKET_NAME }}
+          S3_ARTIFACT_KEY: ${{ env.S3_ARTIFACT_KEY }}
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} bash -c "'
+            set -e
+            cd /home/${{ env.BASTION_USER }}/app-source
+
+            echo Fetching core artifact from S3...
+            mkdir -p libs
+            aws s3 cp s3://$S3_BUCKET_NAME/$S3_ARTIFACT_KEY libs/
+
+            echo Logging into ECR...
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+            echo Building Docker image...
+            docker build --platform linux/arm64 -t $IMAGE_URI:latest .
+
+            echo Pushing Docker image...
+            docker push $IMAGE_URI:latest
+
+            echo Cleaning up Docker system...
+            docker system prune -af
+
+            echo Cleaning up workspace...
+            rm -rf libs
+          '"
 
       - name: Fetch kubeconfig via Bastion
         run: |
           echo "${{ secrets.BASTION_PEM_KEY }}" > bastion_key.pem
           chmod 600 bastion_key.pem
-          ssh -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} "aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}"
           scp -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:~/.kube/config ./kubeconfig
-    
-      - name: Fetch AWS Secrets & Store in Kubernetes
+
+      - name: Configure kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Create/update Kubernetes secrets
         env:
           KUBECONFIG: ${{ github.workspace }}/kubeconfig
         run: |
           DB=$(aws secretsmanager get-secret-value --secret-id rtb-dev/db --query SecretString --output text)
           AW=$(aws secretsmanager get-secret-value --secret-id rtb-dev/aws --query SecretString --output text)
           SERVICE=$(aws secretsmanager get-secret-value --secret-id rtb-dev/tenant-service --query SecretString --output text)
+
           if [ -z "$DB" ] || [ -z "$AW" ]; then
             echo "❌ Missing AWS secrets" && exit 1
           fi
+
           echo "$DB" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' > /tmp/secrets.env
           echo "$AW" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
           echo "$SERVICE" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
+
           tac /tmp/secrets.env | awk -F= '!seen[$1]++' | tac > /tmp/secrets.unique.env
+
           PUB_B64=$(base64 public_key.pem | tr -d '\n')
           echo "PUBLIC_KEY_CONTENT=${PUB_B64}" >> /tmp/secrets.unique.env
-    
+
           kubectl delete secret ${{ env.DEPLOYMENT_NAME }} -n ${{ env.K8S_NAMESPACE }} --ignore-not-found
-          kubectl create secret generic ${{ env.DEPLOYMENT_NAME }} \
-            --from-env-file=/tmp/secrets.unique.env \
-            -n ${{ env.K8S_NAMESPACE }} \
-            --dry-run=client -o yaml | kubectl apply -f -
-    
-      - name: Set up Docker Buildx for multi-arch build
-        uses: docker/setup-buildx-action@v2
-        with:
-          driver: docker-container
-          buildkitd-flags: --debug
-          install: true
-    
-      - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region ${{ env.AWS_REGION }} \
-            | docker login --username AWS --password-stdin \
-              ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          kubectl create secret generic ${{ env.DEPLOYMENT_NAME }} --from-env-file=/tmp/secrets.unique.env -n ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Set VERSION env variable
-        run: echo "VERSION=$(git rev-parse --short HEAD)-${{ github.run_number }}" >> $GITHUB_ENV
-      
-      - name: Build & Push Docker image
-        run: |
-          IMAGE_URI=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DEPLOYMENT_NAME }}
-          docker buildx build \
-            --platform linux/arm64 \
-            --cache-from type=registry,ref=${IMAGE_URI}:cache \
-            --cache-to   type=registry,ref=${IMAGE_URI}:cache,mode=max \
-            -t ${IMAGE_URI}:${{ env.VERSION }} \
-            -t ${IMAGE_URI}:latest \
-            --push .
-
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'latest'
-
-      - name: Fetch kubeconfig via Bastion
-        run: |
-          echo "${{ secrets.BASTION_PEM_KEY }}" > bastion_key.pem
-          chmod 600 bastion_key.pem
-          ssh -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} "aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}"
-          scp -o StrictHostKeyChecking=no -i bastion_key.pem ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:~/.kube/config ./kubeconfig
-
-      - name: Create/update Kubernetes secret
+      - name: Deploy updated image to EKS
         env:
           KUBECONFIG: ${{ github.workspace }}/kubeconfig
-        run: |
-          DB_SECRET=$(aws secretsmanager get-secret-value --secret-id rtb-dev/db --query SecretString --output text)
-          AW_SECRET=$(aws secretsmanager get-secret-value --secret-id rtb-dev/aws --query SecretString --output text)
-          SERVICE_SECRET=$(aws secretsmanager get-secret-value --secret-id rtb-dev/tenant-service --query SecretString --output text)
-          echo "$DB_SECRET" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' > /tmp/secrets.env
-          echo "$AW_SECRET" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
-          echo "$SERVICE_SECRET" | jq -r 'to_entries|.[]|"\(.key)=\(.value)"' >> /tmp/secrets.env
-          echo "PUBLIC_KEY_CONTENT=$(base64 public_key.pem | tr -d '\n')" >> /tmp/secrets.env
-          kubectl -n ${{ env.K8S_NAMESPACE }} delete secret ${{ env.DEPLOYMENT_NAME }} --ignore-not-found
-          kubectl -n ${{ env.K8S_NAMESPACE }} create secret generic ${{ env.DEPLOYMENT_NAME }} --from-env-file=/tmp/secrets.env --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Deploy to EKS
-        env:
-          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+          IMAGE_URI: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DEPLOYMENT_NAME }}
         run: |
           kubectl -n ${{ env.K8S_NAMESPACE }} patch deployment ${{ env.DEPLOYMENT_NAME }} -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"deployTime\":\"$(date +'%s')\"}}}}}"
-          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/${{ env.DEPLOYMENT_NAME }} ${{ env.DEPLOYMENT_NAME }}=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.DEPLOYEMENT_NAME }}:${{ env.VERSION }}
+          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/${{ env.DEPLOYMENT_NAME }} ${{ env.DEPLOYMENT_NAME }}=$IMAGE_URI:latest
           kubectl -n ${{ env.K8S_NAMESPACE }} rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=300s
